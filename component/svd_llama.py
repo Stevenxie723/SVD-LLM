@@ -134,22 +134,25 @@ class SVD_LlamaAttention(nn.Module):
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
+        self.num_key_value_heads = getattr(config, 'num_key_value_heads', self.num_heads)
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         _r = ratios or {}
         def _lr(name, out, in_):
             r = _r.get(name, ratio)
             return int(out * in_ * r / (out + in_))
         q_out = self.num_heads * self.head_dim
+        kv_out = self.num_key_value_heads * self.head_dim
         q_lr = _lr("q_proj", q_out, self.hidden_size)
-        k_lr = _lr("k_proj", q_out, self.hidden_size)
-        v_lr = _lr("v_proj", q_out, self.hidden_size)
+        k_lr = _lr("k_proj", kv_out, self.hidden_size)
+        v_lr = _lr("v_proj", kv_out, self.hidden_size)
         o_lr = _lr("o_proj", self.hidden_size, q_out)
         self.q_u_proj = nn.Linear(q_lr, q_out, bias=False)
         self.q_v_proj = nn.Linear(self.hidden_size, q_lr, bias=False)
 
-        self.k_u_proj = nn.Linear(k_lr, q_out, bias=False)
+        self.k_u_proj = nn.Linear(k_lr, kv_out, bias=False)
         self.k_v_proj = nn.Linear(self.hidden_size, k_lr, bias=False)
 
-        self.v_u_proj = nn.Linear(v_lr, q_out, bias=False)
+        self.v_u_proj = nn.Linear(v_lr, kv_out, bias=False)
         self.v_v_proj = nn.Linear(self.hidden_size, v_lr, bias=False)
 
         self.o_u_proj = nn.Linear(o_lr, self.hidden_size, bias=False)
@@ -173,15 +176,15 @@ class SVD_LlamaAttention(nn.Module):
     
         query_states = self.q_u_proj(self.q_v_proj(hidden_states)).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        key_states = self.k_u_proj(self.k_v_proj(hidden_states)).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = self.k_u_proj(self.k_v_proj(hidden_states)).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        value_states = self.v_u_proj(self.v_v_proj(hidden_states)).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        value_states = self.v_u_proj(self.v_v_proj(hidden_states)).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
- 
+
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         # [bsz, nh, t, hd]
 
@@ -191,6 +194,10 @@ class SVD_LlamaAttention(nn.Module):
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
         past_key_value = (key_states, value_states) if use_cache else None
+
+        if self.num_key_value_groups > 1:
+            key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
+            value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
