@@ -89,19 +89,26 @@ class SVD_LlamaMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
-        ratio=1
+        ratio=1,
+        ratios=None,
     ):
         super().__init__()
         self.ratio = ratio
-        low_rank = int(intermediate_size * hidden_size * self.ratio / (intermediate_size + hidden_size))
-        self.gate_u_proj = nn.Linear(low_rank, intermediate_size, bias=False)
-        self.gate_v_proj = nn.Linear(hidden_size, low_rank, bias=False)
-        
-        self.down_u_proj = nn.Linear(low_rank, hidden_size, bias=False)
-        self.down_v_proj = nn.Linear(intermediate_size, low_rank, bias=False)
-        
-        self.up_u_proj = nn.Linear(low_rank, intermediate_size, bias=False)
-        self.up_v_proj = nn.Linear(hidden_size, low_rank, bias=False)
+        _r = ratios or {}
+        def _lr(name, out, in_):
+            r = _r.get(name, ratio)
+            return int(out * in_ * r / (out + in_))
+        gate_lr = _lr("gate_proj", intermediate_size, hidden_size)
+        down_lr = _lr("down_proj", hidden_size, intermediate_size)
+        up_lr   = _lr("up_proj",   intermediate_size, hidden_size)
+        self.gate_u_proj = nn.Linear(gate_lr, intermediate_size, bias=False)
+        self.gate_v_proj = nn.Linear(hidden_size, gate_lr, bias=False)
+
+        self.down_u_proj = nn.Linear(down_lr, hidden_size, bias=False)
+        self.down_v_proj = nn.Linear(intermediate_size, down_lr, bias=False)
+
+        self.up_u_proj = nn.Linear(up_lr, intermediate_size, bias=False)
+        self.up_v_proj = nn.Linear(hidden_size, up_lr, bias=False)
         self.act_fn = ACT2FN[hidden_act]
 
     def forward(self, x):
@@ -113,7 +120,7 @@ class SVD_LlamaMLP(nn.Module):
 class SVD_LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: LlamaConfig, ratio=1):
+    def __init__(self, config: LlamaConfig, ratio=1, ratios=None):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -127,18 +134,26 @@ class SVD_LlamaAttention(nn.Module):
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
-        low_rank = int(self.hidden_size * self.ratio/2)
-        self.q_u_proj = nn.Linear(low_rank, self.num_heads * self.head_dim, bias=False)
-        self.q_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
+        _r = ratios or {}
+        def _lr(name, out, in_):
+            r = _r.get(name, ratio)
+            return int(out * in_ * r / (out + in_))
+        q_out = self.num_heads * self.head_dim
+        q_lr = _lr("q_proj", q_out, self.hidden_size)
+        k_lr = _lr("k_proj", q_out, self.hidden_size)
+        v_lr = _lr("v_proj", q_out, self.hidden_size)
+        o_lr = _lr("o_proj", self.hidden_size, q_out)
+        self.q_u_proj = nn.Linear(q_lr, q_out, bias=False)
+        self.q_v_proj = nn.Linear(self.hidden_size, q_lr, bias=False)
 
-        self.k_u_proj = nn.Linear(low_rank, self.num_heads * self.head_dim, bias=False)
-        self.k_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
+        self.k_u_proj = nn.Linear(k_lr, q_out, bias=False)
+        self.k_v_proj = nn.Linear(self.hidden_size, k_lr, bias=False)
 
-        self.v_u_proj = nn.Linear(low_rank, self.num_heads * self.head_dim, bias=False)
-        self.v_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
+        self.v_u_proj = nn.Linear(v_lr, q_out, bias=False)
+        self.v_v_proj = nn.Linear(self.hidden_size, v_lr, bias=False)
 
-        self.o_u_proj = nn.Linear(low_rank, self.hidden_size, bias=False)
-        self.o_v_proj = nn.Linear(self.num_heads * self.head_dim, low_rank, bias=False)
+        self.o_u_proj = nn.Linear(o_lr, self.hidden_size, bias=False)
+        self.o_v_proj = nn.Linear(q_out, o_lr, bias=False)
 
         self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
 

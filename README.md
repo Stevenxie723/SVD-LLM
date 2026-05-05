@@ -1,3 +1,5 @@
+> **Note:** This repository contains an unofficial re-implementation of SVD-LLM V2 built on top of the original SVD-LLM codebase. The official repository for both SVD-LLM and SVD-LLM V2 is maintained by the original authors at [AIoT-MLSys-Lab/SVD-LLM](https://github.com/AIoT-MLSys-Lab/SVD-LLM).
+
 <p align="center">
 <img src="figures/logo.png" width="30%"> <br>
 </p>
@@ -124,6 +126,60 @@ python SVDLLM.py \
 --step 5 \
 --model_path COMPRESSD_MODEL_SAVING_PATH  \
 ```
+## Step-by-Step Instructions of SVD-LLM V2
+
+SVD-LLM V2 introduces two improvements over V1: **heterogeneous compression ratio allocation** (different ratios per weight matrix based on truncation loss) and **loss-optimized weight truncation** (double SVD instead of Cholesky decomposition). Both are run in a single step.
+
+### 1. Compress with SVD-LLM V2
+```
+python SVDLLM.py \
+--step 6 \
+--ratio COMPRESSION_RATIO \
+--model HUGGINGFACE_MODEL_REPO \
+--whitening_nsamples WHITENING_SAMPLE_NUMBER \
+--dataset WHITENING_DATASET \
+--seed SAMPLING_SEED \
+--model_seq_len MODEL_SEQ_LEN \
+--save_path COMPRESSED_MODEL_SAVING_PATH
+```
+
+To run on a memory-constrained GPU, add `--run_low_resource`.
+
+If you have already computed and saved a V2 profiling matrix (raw XX^T), you can skip re-profiling by passing `--profiling_mat_path`:
+```
+python SVDLLM.py \
+--step 6 \
+--ratio COMPRESSION_RATIO \
+--model HUGGINGFACE_MODEL_REPO \
+--profiling_mat_path V2_PROFILING_MAT_PATH \
+--save_path COMPRESSED_MODEL_SAVING_PATH
+```
+
+### 2. Evaluation
+Evaluation commands are the same as SVD-LLM V1 (steps 4 and 5):
+```
+python SVDLLM.py \
+--step 4 \
+--model_path COMPRESSED_MODEL_SAVING_PATH
+```
+
+### Example: Compress LLaMA-7B at 20% compression ratio
+```
+python SVDLLM.py \
+--step 6 \
+--ratio 0.2 \
+--model jeffwan/llama-7b-hf \
+--whitening_nsamples 256 \
+--dataset wikitext2 \
+--seed 0 \
+--model_seq_len 2048 \
+--save_path ./compressed
+
+python SVDLLM.py \
+--step 4 \
+--model_path ./compressed/jeffwan_llama_7b_hf_v2_0.8.pt
+```
+
 ## Citation
 If you find this work useful, please cite
 ```
