@@ -102,13 +102,14 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp.cpu()
             cache['i'] += 1
-            if cache['attention_mask'] is None:
-                cache['attention_mask'] = kwargs['attention_mask'].cpu()
+            if cache['i'] == 1:
+                cache['attention_mask'] = kwargs['attention_mask'].cpu() if kwargs.get('attention_mask') is not None else None
                 if "opt" not in model_name:
-                    cache['position_ids'] = kwargs['position_ids'].cpu()
+                    cache['position_ids'] = kwargs['position_ids'].cpu() if kwargs.get('position_ids') is not None else None
             else:
-                cache['attention_mask'] = torch.cat((cache['attention_mask'], kwargs['attention_mask'].cpu()), dim=0)
-                if "opt" not in model_name:
+                if kwargs.get('attention_mask') is not None:
+                    cache['attention_mask'] = torch.cat((cache['attention_mask'], kwargs['attention_mask'].cpu()), dim=0)
+                if "opt" not in model_name and kwargs.get('position_ids') is not None:
                     cache['position_ids'] = torch.cat((cache['position_ids'], kwargs['position_ids'].cpu()), dim=0)
             raise ValueError
     layers[0] = Catcher(layers[0])
@@ -151,10 +152,12 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
             subset[name].scaling_diag_matrix = 0
             handles.append(subset[name].register_forward_hook(hook))
         for j in range(inps.shape[0]):
+            att_m = attention_masks[j].unsqueeze(0).to(dev) if attention_masks is not None else None
             if "opt" not in model_name:
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_masks[j].unsqueeze(0).to(dev), position_ids=position_ids[j].unsqueeze(0).to(dev))[0]
+                pos_i = position_ids[j].unsqueeze(0).to(dev) if position_ids is not None else None
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=att_m, position_ids=pos_i)[0]
             else:
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_masks[j].unsqueeze(0).to(dev))[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=att_m)[0]
         for h in handles:
             h.remove()
         layer = layer.cpu()
@@ -314,13 +317,14 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
             cache['i'] += 1
-            if cache['attention_mask'] is None:
+            if cache['i'] == 1:
                 cache['attention_mask'] = kwargs['attention_mask']
                 if "opt" not in model_name:
                     cache['position_ids'] = kwargs['position_ids']
             else:
-                cache['attention_mask'] = torch.cat((cache['attention_mask'], kwargs['attention_mask']), dim=0)
-                if "opt" not in model_name:
+                if kwargs.get('attention_mask') is not None:
+                    cache['attention_mask'] = torch.cat((cache['attention_mask'], kwargs['attention_mask']), dim=0)
+                if "opt" not in model_name and kwargs.get('position_ids') is not None:
                     cache['position_ids'] = torch.cat((cache['position_ids'], kwargs['position_ids']), dim=0)
             raise ValueError
     layers[0] = Catcher(layers[0])
@@ -503,7 +507,7 @@ class local_update:
 # ─────────────────────────────────────────────
 
 @torch.no_grad()
-def profle_svdllm_v2(name, model, calib_loader, dev):
+def profle_svdllm_v2(name, model, calib_loader, dev, use_fp32=False):
     """Profiling for V2: accumulates raw XX^T per layer (no Cholesky)."""
     if "llama" in name or "mistral" in name or "vicuna" in name:
         layers = model.model.layers
@@ -541,7 +545,7 @@ def profle_svdllm_v2(name, model, calib_loader, dev):
         layer_profile = {}
         subset = find_layers(layers[i])
         for n in subset:
-            raw_S = subset[n].raw_scaling_diag_matrix.double().to(dev)
+            raw_S = subset[n].raw_scaling_diag_matrix.float().to(dev) if use_fp32 else subset[n].raw_scaling_diag_matrix.double().to(dev)
             layer_profile[n] = raw_S.cpu()
             subset[n].raw_scaling_diag_matrix = None
             del raw_S
@@ -551,7 +555,7 @@ def profle_svdllm_v2(name, model, calib_loader, dev):
 
 
 @torch.no_grad()
-def profle_svdllm_v2_low_resource(model_name, model, calib_loader, dev):
+def profle_svdllm_v2_low_resource(model_name, model, calib_loader, dev, use_fp32=False):
     """Memory-efficient V2 profiling (one layer at a time): stores raw XX^T."""
     if "opt" in model_name:
         layers = model.model.decoder.layers
@@ -576,13 +580,14 @@ def profle_svdllm_v2_low_resource(model_name, model, calib_loader, dev):
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp.cpu()
             cache['i'] += 1
-            if cache['attention_mask'] is None:
-                cache['attention_mask'] = kwargs['attention_mask'].cpu()
+            if cache['i'] == 1:
+                cache['attention_mask'] = kwargs['attention_mask'].cpu() if kwargs.get('attention_mask') is not None else None
                 if "opt" not in model_name:
-                    cache['position_ids'] = kwargs['position_ids'].cpu()
+                    cache['position_ids'] = kwargs['position_ids'].cpu() if kwargs.get('position_ids') is not None else None
             else:
-                cache['attention_mask'] = torch.cat((cache['attention_mask'], kwargs['attention_mask'].cpu()), dim=0)
-                if "opt" not in model_name:
+                if kwargs.get('attention_mask') is not None:
+                    cache['attention_mask'] = torch.cat((cache['attention_mask'], kwargs['attention_mask'].cpu()), dim=0)
+                if "opt" not in model_name and kwargs.get('position_ids') is not None:
                     cache['position_ids'] = torch.cat((cache['position_ids'], kwargs['position_ids'].cpu()), dim=0)
             raise ValueError
     layers[0] = Catcher(layers[0])
@@ -625,10 +630,12 @@ def profle_svdllm_v2_low_resource(model_name, model, calib_loader, dev):
             subset[n].scaling_diag_matrix = 0
             handles.append(subset[n].register_forward_hook(hook))
         for j in range(inps.shape[0]):
+            att_m = attention_masks[j].unsqueeze(0).to(dev) if attention_masks is not None else None
             if "opt" not in model_name:
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_masks[j].unsqueeze(0).to(dev), position_ids=position_ids[j].unsqueeze(0).to(dev))[0]
+                pos_i = position_ids[j].unsqueeze(0).to(dev) if position_ids is not None else None
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=att_m, position_ids=pos_i)[0]
             else:
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_masks[j].unsqueeze(0).to(dev))[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=att_m)[0]
         for h in handles:
             h.remove()
         layer = layer.cpu()
@@ -636,7 +643,7 @@ def profle_svdllm_v2_low_resource(model_name, model, calib_loader, dev):
             subset[n].scaling_diag_matrix = subset[n].scaling_diag_matrix.cpu()
         torch.cuda.empty_cache()
         for n in subset:
-            raw_S = subset[n].scaling_diag_matrix.double().to(dev)
+            raw_S = subset[n].scaling_diag_matrix.float().to(dev) if use_fp32 else subset[n].scaling_diag_matrix.double().to(dev)
             layer_profile[n] = raw_S.cpu()
             subset[n].scaling_diag_matrix = None
             del raw_S
@@ -834,13 +841,14 @@ if __name__ == '__main__':
 
     parser.add_argument('--model', type=str, default='jeffwan/llama-7b-hf', help='LLaMA model to load, pass `jeffwan/llama-7b-hf`')
     parser.add_argument('--model_path', type=str, default=None, help='local compressed model path or whitening information path')
-    parser.add_argument('--ratio', type=float, default=0.2, help='Target compression ratio,(0,1), default=0.2, means only keeping about 20% of the params.')
+    parser.add_argument('--ratio', type=float, default=0.2, help='Target compression ratio,(0,1), default=0.2, means only keeping about 20%% of the params.')
     parser.add_argument('--run_low_resource', action='store_true', help='whether to run whitening in low resource, exp, compress LLaMA-7B below 15G gpu')
     parser.add_argument('--dataset', type=str, default='wikitext2',help='Where to extract calibration data from [wikitext2, ptb, c4]')
     parser.add_argument('--whitening_nsamples', type=int, default=256, help='Number of calibration data samples for whitening.')
     parser.add_argument('--updating_nsamples', type=int, default=16, help='Number of calibration data samples for udpating.')
     parser.add_argument('--save_path', type=str, default=None, help='the path to save the compressed model checkpoints.`')
     parser.add_argument('--profiling_mat_path', type=str, default=None, help='Local path to load the profiling matrices`')
+    parser.add_argument('--use_fp32_profiling', action='store_true', help='whether to store profiling matrices in fp32 (Warning: might cause numerical issues)')
     parser.add_argument('--seed',type=int, default=0, help='Seed for sampling the calibration data')
     parser.add_argument('--DEV', type=str, default="cuda", help='device')
     parser.add_argument('--model_seq_len', type=int, default=2048, help='the default sequence length of the LLM')
@@ -893,9 +901,9 @@ if __name__ == '__main__':
         if args.profiling_mat_path is None:
             cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
             if args.run_low_resource:
-                profiling_mat = profle_svdllm_v2_low_resource(args.model, model, cali_white_data, args.DEV)
+                profiling_mat = profle_svdllm_v2_low_resource(args.model, model, cali_white_data, args.DEV, use_fp32=args.use_fp32_profiling)
             else:
-                profiling_mat = profle_svdllm_v2(args.model, model, cali_white_data, args.DEV)
+                profiling_mat = profle_svdllm_v2(args.model, model, cali_white_data, args.DEV, use_fp32=args.use_fp32_profiling)
             if args.save_path is not None:
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_v2_' + args.dataset + '_' + str(args.whitening_nsamples) + '_' + str(args.seed) + '.pt')
         else:
