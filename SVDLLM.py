@@ -548,11 +548,11 @@ def profle_svdllm_v2(name, model, calib_loader, dev, use_fp32=False):
         layer_profile = {}
         subset = find_layers(layers[i])
         for n in subset:
-            raw_S = subset[n].raw_scaling_diag_matrix.float().to(dev) if use_fp32 else subset[n].raw_scaling_diag_matrix.double().to(dev)
-            layer_profile[n] = raw_S.cpu()
+            # raw_scaling_diag_matrix was accumulated in float32; storing as-is avoids
+            # a pointless float64 conversion that doubles memory without adding precision
+            # (consumers call .double() themselves before computation).
+            layer_profile[n] = subset[n].raw_scaling_diag_matrix
             subset[n].raw_scaling_diag_matrix = None
-            del raw_S
-            torch.cuda.empty_cache()
         profiling_mat[i] = layer_profile
     return profiling_mat
 
@@ -615,10 +615,9 @@ def profle_svdllm_v2_low_resource(model_name, model, calib_loader, dev, use_fp32
         subset = find_layers(layer)
         for n, module in subset.items():
             if module in layer_stats[i]:
-                raw_S = layer_stats[i][module].float().to(dev) if use_fp32 else layer_stats[i][module].double().to(dev)
-                layer_profile[n] = raw_S.cpu()
-                del raw_S
-                # Clear from memory
+                # Keep as float32; consumers call .double() themselves before use.
+                mat = layer_stats[i][module]
+                layer_profile[n] = mat.cpu() if mat.is_cuda else mat
                 layer_stats[i][module] = None
             torch.cuda.empty_cache()
         profiling_mat[i] = layer_profile
@@ -875,6 +874,8 @@ if __name__ == '__main__':
                 profiling_mat = profle_svdllm_v2_low_resource(args.model, model, cali_white_data, args.DEV, use_fp32=args.use_fp32_profiling)
             else:
                 profiling_mat = profle_svdllm_v2(args.model, model, cali_white_data, args.DEV, use_fp32=args.use_fp32_profiling)
+            # Profiling left model on CPU; move back to GPU to free CPU RAM before ratio computation.
+            model = model.to(args.DEV)
             if args.save_path is not None:
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_v2_' + args.dataset + '_' + str(args.whitening_nsamples) + '_' + str(args.seed) + '.pt')
         else:
