@@ -1,4 +1,7 @@
 .vscode/*
 cache/*
 **/__pycache__
-utils/c4-*
+utils/c4-*# pixi environments
+.pixi/*
+!.pixi/config.toml
+/logs

@@ -6,6 +6,7 @@ import torch.jit
 from tqdm import tqdm
 import torch
 import torch.nn as nn
+import gc
 
 from utils.data_utils import *
 from component.svd_llama import SVD_LlamaAttention, SVD_LlamaMLP
@@ -183,6 +184,7 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
         profiling_mat[i] = layer_profile
         inps = outs
         torch.cuda.empty_cache()
+        gc.collect()  # Force garbage collection
     return profiling_mat
      
  
@@ -286,6 +288,7 @@ def whitening(model_name, model, profiling_mat, ratio, dev):
             del  W, W_scale, scaling_matrix_inv, scaling_diag_matrix, U, S, VT, truc_s, truc_u, truc_v, sqrtSigma
         del layer
         torch.cuda.empty_cache()
+        gc.collect()  # Force garbage collection for CPU memory
 
 
 @torch.no_grad()
@@ -556,102 +559,70 @@ def profle_svdllm_v2(name, model, calib_loader, dev, use_fp32=False):
 
 @torch.no_grad()
 def profle_svdllm_v2_low_resource(model_name, model, calib_loader, dev, use_fp32=False):
-    """Memory-efficient V2 profiling (one layer at a time): stores raw XX^T."""
-    if "opt" in model_name:
-        layers = model.model.decoder.layers
-        model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev)
-        model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.to(dev)
-        model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(dev)
-    else:
+    """Memory-efficient V2 profiling: run full forward pass but process layer statistics one at a time."""
+    if "llama" in model_name or "mistral" in model_name or "vicuna" in model_name:
         layers = model.model.layers
-        model.model.embed_tokens = model.model.embed_tokens.to(dev)
-        model.model.norm = model.model.norm.to(dev)
-    layers[0] = layers[0].to(dev)
-
-    dtype = next(iter(model.parameters())).dtype
-    inps = torch.zeros(
-        (len(calib_loader), model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
-    )
-    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
-    class Catcher(nn.Module):
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
-        def forward(self, inp, **kwargs):
-            inps[cache['i']] = inp.cpu()
-            cache['i'] += 1
-            if cache['i'] == 1:
-                cache['attention_mask'] = kwargs['attention_mask'].cpu() if kwargs.get('attention_mask') is not None else None
-                if "opt" not in model_name:
-                    cache['position_ids'] = kwargs['position_ids'].cpu() if kwargs.get('position_ids') is not None else None
-            else:
-                if kwargs.get('attention_mask') is not None:
-                    cache['attention_mask'] = torch.cat((cache['attention_mask'], kwargs['attention_mask'].cpu()), dim=0)
-                if "opt" not in model_name and kwargs.get('position_ids') is not None:
-                    cache['position_ids'] = torch.cat((cache['position_ids'], kwargs['position_ids'].cpu()), dim=0)
-            raise ValueError
-    layers[0] = Catcher(layers[0])
-    for batch in calib_loader:
-        try:
-            batch = {k: v.to(dev) for k, v in batch.items()}
-            model(**batch)
-        except ValueError:
-            pass
-    layers[0] = layers[0].module
-    layers[0] = layers[0].cpu()
-    if "opt" in model_name:
-        model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
-        model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.cpu()
-        model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
-    else:
-        model.model.embed_tokens = model.model.embed_tokens.cpu()
-        model.model.norm = model.model.norm.cpu()
-    torch.cuda.empty_cache()
-    outs = torch.zeros_like(inps)
-    attention_masks = cache['attention_mask']
-    if "opt" not in model_name:
-        position_ids = cache['position_ids']
-    profiling_mat = {}
-    print("Start V2 profiling (raw XX^T, layer by layer)...")
-    for i in tqdm(range(len(layers))):
-        layer_profile = {}
-        layer = layers[i].to(dev)
-        subset = find_layers(layer)
+    elif "opt" in model_name:
+        layers = model.model.decoder.layers
+    
+    model = model.to(dev)
+    print("Start obtaining V2 profiling matrix (raw XX^T)...")
+    
+    # Dictionary to store statistics for each layer
+    layer_stats = {i: {} for i in range(len(layers))}
+    
+    def make_hook(layer_idx):
         def hook(module, input, output):
             inp = input[0].detach().float()
             if inp.dim() == 2:
                 inp = inp.unsqueeze(0)
             adds = torch.matmul(inp.transpose(1, 2), inp)
-            module.scaling_diag_matrix += torch.sum(adds, dim=0)
-            del inp, adds, output
+            if module not in layer_stats[layer_idx]:
+                layer_stats[layer_idx][module] = 0
+            layer_stats[layer_idx][module] += torch.sum(adds, dim=0)
+            del inp, adds
             torch.cuda.empty_cache()
-        handles = []
-        for n in subset:
-            subset[n].scaling_diag_matrix = 0
-            handles.append(subset[n].register_forward_hook(hook))
-        for j in range(inps.shape[0]):
-            att_m = attention_masks[j].unsqueeze(0).to(dev) if attention_masks is not None else None
-            if "opt" not in model_name:
-                pos_i = position_ids[j].unsqueeze(0).to(dev) if position_ids is not None else None
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=att_m, position_ids=pos_i)[0]
-            else:
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=att_m)[0]
-        for h in handles:
+        return hook
+    
+    # Register hooks on all layers to collect statistics
+    handles = {}
+    for layer_idx in range(len(layers)):
+        layer = layers[layer_idx]
+        subset = find_layers(layer)
+        handles[layer_idx] = []
+        for n, module in subset.items():
+            handles[layer_idx].append(module.register_forward_hook(make_hook(layer_idx)))
+    
+    # Run full forward pass through all batches
+    for batch in tqdm(calib_loader):
+        batch = {k: v.to(dev) for k, v in batch.items()}
+        model(**batch)
+    
+    # Clean up hooks
+    for layer_idx in handles:
+        for h in handles[layer_idx]:
             h.remove()
-        layer = layer.cpu()
-        for n in subset:
-            subset[n].scaling_diag_matrix = subset[n].scaling_diag_matrix.cpu()
-        torch.cuda.empty_cache()
-        for n in subset:
-            raw_S = subset[n].scaling_diag_matrix.float().to(dev) if use_fp32 else subset[n].scaling_diag_matrix.double().to(dev)
-            layer_profile[n] = raw_S.cpu()
-            subset[n].scaling_diag_matrix = None
-            del raw_S
+    
+    torch.cuda.empty_cache()
+    model = model.cpu()
+    
+    # Process and store statistics one layer at a time
+    profiling_mat = {}
+    print("Storing raw XX^T matrices...")
+    for i in tqdm(range(len(layers))):
+        layer_profile = {}
+        layer = layers[i]
+        subset = find_layers(layer)
+        for n, module in subset.items():
+            if module in layer_stats[i]:
+                raw_S = layer_stats[i][module].float().to(dev) if use_fp32 else layer_stats[i][module].double().to(dev)
+                layer_profile[n] = raw_S.cpu()
+                del raw_S
+                # Clear from memory
+                layer_stats[i][module] = None
             torch.cuda.empty_cache()
-        layers[i] = layer.cpu()
         profiling_mat[i] = layer_profile
-        inps = outs
-        torch.cuda.empty_cache()
+    
     return profiling_mat
 
 
@@ -909,6 +880,14 @@ if __name__ == '__main__':
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
         ratio_map = compute_heterogeneous_ratios(args.model, model, profiling_mat, args.ratio, args.DEV)
+        
+        # Output the compression ratio
+        for i in range(len(profiling_mat)):
+            print(f"Layer {i}:")
+            for name, mat in profiling_mat[i].items():
+                r = ratio_map[i][name]
+                print(f"  {name}: ratio={r:.4f}")
+
         whitening_v2(args.model, model, profiling_mat, ratio_map, args.DEV)
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_v2_' + str(args.ratio) + '.pt')
